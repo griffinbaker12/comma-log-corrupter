@@ -2,6 +2,10 @@ import argparse
 import bz2
 import os
 import random
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, List
 
 import capnp
 import requests
@@ -9,39 +13,66 @@ import requests
 ACCOUNT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NDg1ODI0NjUsIm5iZiI6MTcxNzA0NjQ2NSwiaWF0IjoxNzE3MDQ2NDY1LCJpZGVudGl0eSI6IjBkZWNkZGNmZGYyNDFhNjAifQ.g3khyJgOkNvZny6Vh579cuQj1HLLGSDeauZbfZri9jw"
 DEVICE = "1d3dc3e03047b0c7"
 ROUTE = "000000dd--455f14369d"
-STORAGE_PATH = "./corrupted_routes"
+
+ROUTE_STORAGE_PATH = Path("./routes")
+SCHEMA_BASE = Path(__file__).parent / "schema"
+SCHEMAS = [
+    "log.capnp",
+    "custom.capnp",
+    "legacy.capnp",
+    "car.capnp",
+    "include/c++.capnp",
+]
 
 
-def get_capnp_schema():
-    schema_path = "schema/log.capnp"
-    if not os.path.exists(schema_path):
-        os.makedirs(os.path.dirname(schema_path), exist_ok=True)
-        url = "https://raw.githubusercontent.com/commaai/openpilot/master/cereal/log.capnp"
-        response = requests.get(url)
-        with open(schema_path, "w") as f:
-            f.write(response.text)
-    return capnp.load(schema_path)  # type: ignore
+def load_log_schema():
+    if not all((SCHEMA_BASE / schema).is_file() for schema in SCHEMAS):
+        (SCHEMA_BASE / "include").mkdir(parents=True, exist_ok=True)
+        url = "https://raw.githubusercontent.com/commaai/openpilot/master/cereal/"
+        for schema in SCHEMAS:
+            response = requests.get(f"{url}{schema}")
+            response.raise_for_status()
+            (SCHEMA_BASE / schema).write_text(response.text)
+    return capnp.load(str(SCHEMA_BASE / "log.capnp"))  # type: ignore
 
 
-log = get_capnp_schema()
+capnp.remove_import_hook()  # type: ignore
+log = load_log_schema()
 
 
-def download_route(account, device, route):
+def download_file(url: str, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        for chunk in requests.get(url, stream=True).iter_content(chunk_size=8192):
+            f.write(chunk)
+    return str(path)
+
+
+def download_route(account: str, device: str, route: str) -> Dict[str, List[str]]:
     url = f"https://api.commadotai.com/v1/route/{device}|{route}/files"
-    headers = {"Authorization": f"JWT {account}"}
-    response = requests.get(url, headers=headers)
+    response = requests.get(url, headers={"Authorization": f"JWT {account}"})
+    response.raise_for_status()
     files = response.json()
-
-    route_data = {"qlogs": [], "qcameras": []}
-    for file_type in ["qlogs", "qcameras"]:
-        for i, url in enumerate(files[file_type]):
-            response = requests.get(url)
-            path = f'{STORAGE_PATH}/{route}/{route}--{i}/{file_type[:-1]}.{"bz2" if file_type == "qlogs" else "ts"}'
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(response.content)
-            route_data[file_type].append(path)
-
+    route_data = defaultdict(list)
+    with ThreadPoolExecutor() as executor:
+        future_to_url = {}
+        for file_type in ("qlogs", "qcameras"):
+            for i, url in enumerate(files[file_type]):
+                path = (
+                    ROUTE_STORAGE_PATH
+                    / route
+                    / f"{route}--{i}"
+                    / f"{file_type[:-1]}.{'bz2' if file_type == 'qlogs' else 'ts'}"
+                )
+                future = executor.submit(download_file, url, path)
+                future_to_url[future] = (file_type, url)
+        for future in as_completed(future_to_url):
+            file_type, url = future_to_url[future]
+            try:
+                path = future.result()
+                route_data[file_type].append(path)
+            except Exception as exc:
+                print(f"{url} generated an exception: {exc}")
     return route_data
 
 
@@ -78,8 +109,8 @@ def corrupt_route(route_data, corruption):
     for i, (qlog_path, qcam_path) in enumerate(
         zip(route_data["qlogs"], route_data["qcameras"])
     ):
-        new_qlog_path = f"{STORAGE_PATH}/{new_route}/{new_route}--{i}/qlog.bz2"
-        new_qcam_path = f"{STORAGE_PATH}/{new_route}/{new_route}--{i}/qcamera.ts"
+        new_qlog_path = f"{ROUTE_STORAGE_PATH}/{new_route}/{new_route}--{i}/qlog.bz2"
+        new_qcam_path = f"{ROUTE_STORAGE_PATH}/{new_route}/{new_route}--{i}/qcamera.ts"
         os.makedirs(os.path.dirname(new_qlog_path), exist_ok=True)
 
         with open(qlog_path, "rb") as f:
@@ -119,15 +150,24 @@ def main():
         help="JWT access token for comma account",
     )
     parser.add_argument(
-        "-d", "--device", type=str, default=DEVICE, help="dongleId of the device"
+        "-d",
+        "--device",
+        type=str,
+        default=DEVICE,
+        help="dongleId of the device",
     )
     parser.add_argument(
-        "-r", "--route", type=str, default=ROUTE, help="Route ID to corrupt"
+        "-r",
+        "--route",
+        type=str,
+        default=ROUTE,
+        help="Route ID to corrupt",
     )
     args = parser.parse_args()
 
     route_data = download_route(args.account, args.device, args.route)
-    verify_route(route_data)
+    # verify_route(route_data)
+    exit(1)
 
     corruptions = [
         "no_date_time",
